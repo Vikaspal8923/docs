@@ -262,7 +262,11 @@ Now this is one of the important phase of offline support functionality. Here we
 
 #### 1. fetching pending writes (`getPendingWrites`)
 
-- Use `getPendingAndRetryableWrites(userId)` to retrieve all records where syncStatus is either "pending" or "failed" (with retries < MAX_RETRIES).
+- Use the following method to retrieve all records:
+
+  ```ts
+  getPendingAndRetryableWrites(userId)
+```
 
 ```ts
 export async function getPendingAndRetryableWrites(
