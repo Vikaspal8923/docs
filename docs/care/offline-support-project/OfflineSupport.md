@@ -258,164 +258,356 @@ export const saveOfflineWrite = async ({
 
 ### Phase 3: Synchronization
 
-Now this is one of the important phase of offline support functionality. Here we will synchronize the data that we save during offline. so for that we need a sync manage . A production‑grade sync manager should include:
+## Core Components
 
-#### 1. fetching pending writes (`getPendingWrites`)
+### 1. SyncManager Class
 
-- Use the following method to retrieve all records:
+The main orchestrator for offline synchronization.
 
-  ```ts
-  getPendingAndRetryableWrites(userId)
+**Location:** `src/OfflineSupport/syncmanger.ts`
+
+**Purpose:** Coordinates the entire sync process, manages dependencies, handles errors, and ensures data consistency across offline and online states.
+
+**Key Features:**
+- Dependency-aware sync processing
+- ID mapping persistence
+- Error classification and retry logic
+- Progress tracking and abort control
+- Conflict detection
+
+**Usage:**
+```typescript
+const syncManager = new SyncManager({
+  userId: "user-id",
+  maxRetries: 3,
+  retryDelayMs: 1000,
+  enableConflictDetection: true,
+  onProgress: (synced, total) => console.log(`${synced}/${total}`),
+  onSyncStart: (total) => console.log(`Starting sync of ${total} items`),
+  onSyncComplete: () => console.log("Sync completed"),
+});
+
+const result = await syncManager.sync();
 ```
 
-```ts
-export async function getPendingAndRetryableWrites(
-  userId: string
-): Promise<OfflineWriteRecord[]> {
-  return db.offlineWrites
-    .where("userId")
-    .equals(userId)
-    .and((w) => {
-      const isPending = w.syncStatus === "pending";
-      const isFailedButRetryable =
-        w.syncStatus === "failed" && (w.retries || 0) < MAX_RETRIES;
-      return isPending || isFailedButRetryable;
-    })
-    .toArray();
-}
+### 2. IdMap Class
+
+Manages offline-to-server ID mappings across sync sessions.
+
+**Location:** `src/OfflineSupport/idMap.ts`
+
+**Purpose:** Maintains a mapping between offline-generated IDs and server-generated IDs, ensuring that dependent writes can reference the correct server IDs even across multiple sync sessions.
+
+**Features:**
+- Pre-population from successful sync records
+- In-memory caching with IndexedDB persistence
+- Automatic mapping updates
+
+**Usage:**
+```typescript
+const idMap = new IdMap();
+
+// Pre-populate with existing mappings
+idMap.prePopulateFromSuccessfulSyncs(successfulWrites);
+
+// Add new mapping
+idMap.addMapping("offline-123", "server-456");
+
+// Get server ID
+const serverId = idMap.getServerId("offline-123");
 ```
 
-#### 2. Processing each write (`syncOneWrite`) with proper error/409 handling and Retry/backoff logic (`shouldRetry`, `computeBackoffDelay`, scheduleRetry).
+### 3. Write Queue Management
 
-- For every item in that list, call `syncOneWrite(write)`, which:
-  Runs conflict detection first (`detectAndMarkConflict`). If the server’s `modified_date` differs from the cached `serverTimestamp`, it immediately marks that record as "conflict" and skips any further mutation.
-- If no `conflict`, attempts the API mutation `(mutate(route, payload))`.
-- On success, updates syncStatus = "success" and timestamps the write.
-    • On error: If HTTP 409, marks `syncStatus = "conflict"` and stores the server’s data in conflictData. Otherwise, marks syncStatus = "failed", increments retries, saves the error message, and—if `retries < MAX_RETRIES—schedules` a retry via `computeBackoffDelay(retries) + scheduleRetry`.
+Handles the lifecycle of offline writes.
 
-```ts
-export async function syncOneWrite(write: OfflineWriteRecord): Promise<void> {
-  const now = Date.now();
+**Location:** `src/OfflineSupport/writeQueue.ts`
 
-  // 1) Detect (and mark) conflict up front
-  const didConflict = await detectAndMarkConflict(write);
-  if (didConflict) {
-    return;
-  }
+**Purpose:** Manages the state and lifecycle of offline writes, including retry logic, status updates, and dependency management between parent and child writes.
 
-  try {
-    // 2) Execute the mutation route
-    const route = offlineRoutes[write.syncrouteKey as OfflineRouteKey];
-    const mutationFn = mutate(route, { pathParams: write.pathParams as any });
-    await mutationFn(write.payload);
+**Key Functions:**
+- `getPendingAndRetryableWrites()` - Retrieves writes ready for sync
+- `markWriteStatus()` - Updates write status and metadata
+- `unblockDependentWrites()` - Unblocks writes when parent succeeds
 
-    // 3) On success, mark as synced
-    await db.offlineWrites.update(write.id, {
-      syncStatus: "success",
-      lastAttemptAt: now,
-    });
+**Write States:**
+- `pending` - Ready for sync
+- `success` - Successfully synced
+- `failed` - Failed to sync (may be retried)
+- `blocked` - Blocked by failed parent
+- `conflict` - Has conflicts
 
-    toast.success(`Sync succeeded for write ${write.id}`);
-  } catch (error: any) {
-    const nextRetries = (write.retries || 0) + 1;
-    const isConflict = error?.response?.status === 409;
+## Sync Process Flow
 
-    const updateFields: Partial<OfflineWriteRecord> = {
-      lastAttemptAt: now,
-      retries: nextRetries,
-      lastError: error?.message || "Unknown error",
-    };
+### 1. Initialization
+**Purpose:** Ensures sync can only run when appropriate conditions are met and prevents multiple concurrent sync sessions.
 
-    if (isConflict) {
-      // 4.a) On HTTP 409, mark as conflict
-      updateFields.syncStatus = "conflict";
-      updateFields.conflictData = error.response?.data;
-    } else {
-      // 4.b) On other errors, mark as failed
-      updateFields.syncStatus = "failed";
-    }
-
-    await db.offlineWrites.update(write.id, updateFields);
-    toast.error(`Sync failed for write ${write.id}: ${updateFields.lastError}`);
-
-    // 5) Retry/backoff logic (only for non-conflict)
-    if (!isConflict && shouldRetry(nextRetries)) {
-      const delay = computeBackoffDelay(nextRetries);
-      scheduleRetry(write.userId, delay);
-    }
-  }
+```typescript
+// Check if sync is already running
+if (this.isRunning) {
+  throw new Error("Sync is already running");
 }
 
-export function shouldRetry(currentRetries: number): boolean {
-  return currentRetries < MAX_RETRIES;
-}
-
-export function computeBackoffDelay(attempt: number): number {
-  return BASE_BACKOFF_MS * 2 ** (attempt - 1);
-}
-
-export function scheduleRetry(userId: string, delayMs: number): void {
-  setTimeout(() => {
-    processSyncQueue(userId);
-  }, delayMs);
+// Verify online status
+if (!onlineManager.isOnline()) {
+  throw new Error("Cannot sync while offline");
 }
 ```
 
-#### 3. Conflict detection & resolution (`detectAndMarkConflict`) :- If server’s modified_date has changed since we cached it, that’s a conflict.
+### 2. Write Collection
+**Purpose:** Gathers all writes that need to be synced, including pending, failed (retryable), and blocked writes that have been unblocked.
 
-- `detectAndMarkConflict`(write) fetches the current server record (using queryrouteKey/queryParams) and compares `serverData.modified_date` with `write.serverTimestamp`.
-- If they differ, it updates that write’s `syncStatus = "conflict"` and saves conflictData so the UI can prompt the user.
+```typescript
+// Get all writes that need syncing
+const pendingWrites = await getPendingAndRetryableWrites(userId);
 
-```ts
-async function detectAndMarkConflict(
-  write: OfflineWriteRecord
-): Promise<boolean> {
-  if (!write.queryrouteKey || !write.queryParams) {
-    return false;
+// Includes:
+// - pending writes
+// - failed writes (retries < MAX_RETRIES)
+// - blocked writes (unblocked when parent succeeds)
+```
+
+### 3. ID Mapping Pre-population
+**Purpose:** Builds a complete mapping of offline-to-server IDs from all successful writes, ensuring that dependent writes can reference the correct server IDs even if they were created in different sync sessions.
+
+```typescript
+// Get all writes to build complete ID mapping
+const allWrites = await db.OfflineWrites
+  .where("userId")
+  .equals(userId)
+  .toArray();
+
+const successfulWrites = allWrites.filter(
+  write => write.syncStatus === "success"
+);
+
+// Pre-populate ID map with historical mappings
+this.idMap.prePopulateFromSuccessfulSyncs(successfulWrites);
+```
+
+### 4. Dependency Resolution
+**Purpose:** Ensures that writes are processed in the correct order based on their dependencies, preventing errors where child writes reference parent writes that haven't been synced yet.
+
+```typescript
+// Sort writes by dependencies (topological sort)
+const sortedWrites = topologicalSort(pendingWrites);
+
+// Ensures parent writes are processed before children
+// Example: Patient → Encounter → Questionnaire
+```
+
+### 5. Write Processing
+For each write in dependency order:
+
+#### Step 1: Parent Check
+**Purpose:** Verifies that all parent writes are not permanently failed, preventing child writes from attempting to sync when their dependencies cannot be satisfied.
+
+```typescript
+// Check if parent writes are blocked
+if (write.parentMutationIds?.length > 0) {
+  const blockedParents = await this.checkBlockedParents(
+    write.parentMutationIds
+  );
+  if (blockedParents.length > 0) {
+    return { status: "blocked" };
   }
+}
+```
 
-  try {
-    const fetchFn = query(
-      offlineRoutes[write.queryrouteKey as OfflineRouteKey]
-    );
-    const serverData = await fetchFn({ pathParams: write.queryParams as any });
+#### Step 2: Conflict Detection
+**Purpose:** Detects and handles conflicts between offline changes and server state, ensuring data consistency and preventing data corruption.
 
-    if (serverData.modified_date !== write.serverTimestamp) {
-      await db.offlineWrites.update(write.id, {
-        syncStatus: "conflict",
-        conflictData: serverData,
-        lastAttemptAt: Date.now(),
-      });
+```typescript
+// Optional conflict detection
+if (this.options.enableConflictDetection && write.useQueryRouteKey) {
+  const hasConflict = await detectAndMarkConflict(write);
+  if (hasConflict) {
+    return { status: "conflict" };
+  }
+}
+```
+
+#### Step 3: ID Replacement
+**Purpose:** Replaces all offline-generated IDs in the write payload with their corresponding server IDs, ensuring the API receives valid server references.
+
+```typescript
+// Replace offline IDs with server IDs
+const processedWrite = replaceOfflineIdsInWrite(
+  write,
+  dependencySchema,
+  this.idMap
+);
+```
+
+#### Step 4: API Execution
+**Purpose:** Executes the actual API mutation using the processed write data, communicating with the server to persist the offline changes.
+
+```typescript
+// Execute the actual API mutation
+const response = await this.executeMutation(processedWrite);
+```
+
+#### Step 5: Success Handling
+**Purpose:** Updates the write status, stores the server response, creates ID mappings for future reference, and unblocks any dependent writes that were waiting for this write to succeed.
+
+```typescript
+// Update write status
+await markWriteStatus(write.id, "success", {
+  response,
+  lastAttemptAt: Date.now(),
+});
+
+// Store ID mapping
+if (response?.id && write.id.startsWith("offline-")) {
+  this.idMap.addMapping(write.id, response.id);
+}
+
+// Unblock dependent writes
+await unblockDependentWrites(write.id);
+```
+
+#### Step 6: Error Handling
+**Purpose:** Classifies errors as permanent or temporary, updates write status with detailed error information, and blocks dependent writes if the failure is permanent to prevent cascading failures.
+
+```typescript
+// Classify error as permanent or temporary
+const isPermanentFailure = this.isPermanentFailure(error);
+
+// Update write status with error details
+await markWriteStatus(write.id, "failed", {
+  lastError: errorMessage,
+  lastErrorDetails: errorDetails,
+  lastAttemptAt: Date.now(),
+  retries: (write.retries || 0) + 1,
+  isPermanentFailure,
+});
+
+// Block dependent writes if permanent failure
+if (isPermanentFailure) {
+  await this.markDependentWritesAsBlocked(write.id);
+}
+```
+
+## Error Classification
+
+The sync manager intelligently classifies errors:
+
+### Permanent Failures (No Retry)
+- **4xx Errors** (except 429): Validation errors, not found, etc.
+- **Most 5xx Errors**: Server configuration issues
+
+### Temporary Failures (Retry)
+- **429 Rate Limit**: Too many requests
+- **501, 502, 503**: Service unavailable, gateway errors
+- **Network Errors**: Timeouts, connection issues
+
+```typescript
+private isPermanentFailure(error: any): boolean {
+  if (error instanceof HTTPError) {
+    const statusCode = error.status;
+    
+    // 4xx errors are permanent (except 429)
+    if (statusCode >= 400 && statusCode < 500 && statusCode !== 429) {
       return true;
     }
-  } catch (err) {
-    console.warn(`detectAndMarkConflict: failed for write ${write.id}`, err);
+    
+    // 5xx errors: 501, 502, 503 are temporary
+    if (statusCode >= 500) {
+      return ![501, 502, 503].includes(statusCode);
+    }
   }
-
   return false;
 }
 ```
 
-#### 4. Queue orchestration (`processSyncQueue`) triggered by network or timed events.
+## Retry Strategy
 
-- `processSyncQueue(userId)` is triggered whenever the browser fires "online" (via onNetworkStatusChange) .
-- Each pass fetches the current pending/retryable writes and calls syncOneWrite on each in series.
+### Retry Logic
+- **Max Retries**: 5 attempts per write
+- **Retry Condition**: `retries < MAX_RETRIES && !isPermanentFailure`
+- **Retry Timing**: Immediate retry in next sync session
 
-```ts
-export async function processSyncQueue(userId: string): Promise<void> {
-  if (!navigator.onLine || !userId) return;
+### Retry Flow
+1. Write fails → Status: `failed`, `retries++`
+2. Next sync → Include in `pendingWrites` if retries < 5
+3. Retry attempt → Execute mutation again
+4. Success → Status: `success`, unblock dependents
+5. Failure → Repeat until max retries reached
 
-  const writesToProcess = await getPendingAndRetryableWrites(userId);
+## Dependency Management
 
-  for (const write of writesToProcess) {
-    await syncOneWrite(write);
-  }
-}
+### Dependency Schema
+Defined in `src/OfflineSupport/dependencySchema.ts`:
+
+**Purpose:** Defines the relationships between different types of writes, specifying which writes depend on others and how to resolve these dependencies during sync.
+
+```typescript
+export const dependencySchema: DependencySchema = {
+  create_patient: [], // No dependencies
+  create_encounter: [
+    { location: "payload", path: ["patient"], resourceType: "patient" },
+  ],
+  create_appointment: [
+    { location: "payload", path: ["patient"], resourceType: "patient" },
+  ],
+  // ... more dependencies
+};
 ```
 
-#### 5. cleanup (`cleanupSuccessfulWrites`).
+### Dependency Resolution
+1. **Topological Sort**: Ensures correct processing order
+2. **Parent Check**: Verifies parents are not blocked
+3. **Blocking Logic**: Blocks children when parent fails permanently
+4. **Unblocking Logic**: Unblocks children when parent succeeds
 
-- `cleanupSuccessfulWrites(userId, olderThanMs)` deletes any records where `
+## Integration Points
+
+### 1. React Context Integration
+**Location:** `src/context/SyncContext.tsx`
+
+**Purpose:** Provides sync state and controls to React components, enabling UI components to display sync progress and allow users to trigger manual syncs.
+
+Provides sync state and controls to React components:
+
+```typescript
+const { isSyncing, syncedCount, totalCount, startSync, resetSync } = useSync();
+```
+
+### 2. AuthUserProvider Integration
+**Location:** `src/Providers/AuthUserProvider.tsx`
+
+**Purpose:** Automatically triggers sync when users come online and are authenticated, with smart conditions to prevent sync on login pages or when users are not properly authenticated.
+
+Automatic sync triggers with smart conditions:
+
+```typescript
+useEffect(() => {
+  const isOnSessionExpiredPage = location.pathname === "/session-expired";
+  
+  if (
+    !onlineManager.isOnline() ||
+    !user?.external_id ||
+    isSyncing ||
+    localStorage.getItem(LocalStorageKeys.accessToken) === null ||
+    isOnSessionExpiredPage
+  ) {
+    return;
+  }
+
+  const timeout = setTimeout(() => {
+    startSync(user.external_id);
+  }, 3000);
+
+  return () => clearTimeout(timeout);
+}, [user?.external_id, onlineManager.isOnline(), startSync, isSyncing, location.pathname]);
+```
+
+### 3. UI Components
+**Location:** `src/components/Common/SyncBanner.tsx`
+
+**Purpose:** Displays real-time sync progress to users, providing visual feedback about the sync process and completion status.
+
+
 
 
 ### Phase 4: Notifications (Sync Status Page)
